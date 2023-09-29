@@ -40,7 +40,7 @@
 - What this looks like in MM terms:
 
 ```python
-x = torch.tensor([0, 13, 72, 4, 99, 92]) # input, (T)
+x = torch.tensor([0, 13, 72, 4, 99, 92]) # input: a list of tokens of length 'context size', (T)
 T = x.shape[0] # time dimension
 V = int(x.max().item() + 1) # vocab size
 C = 3 # embedding channels
@@ -66,9 +66,9 @@ tensor([[-0.6410, -0.7645, -0.8557],
 """
 
 # This can be achieved in MM by using a normalized triangular matrix:
-z = torch.tril(torch.ones(T, T))
-z = z / torch.sum(z, 1, keepdim=True)
-print(z)
+w = torch.tril(torch.ones(T, T))
+w = w / torch.sum(w, 1, keepdim=True)
+print(w)
 """
 tensor([[1.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000],
         [0.5000, 0.5000, 0.0000, 0.0000, 0.0000, 0.0000],
@@ -77,18 +77,18 @@ tensor([[1.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000],
         [0.2000, 0.2000, 0.2000, 0.2000, 0.2000, 0.0000],
         [0.1667, 0.1667, 0.1667, 0.1667, 0.1667, 0.1667]])
 """
-aggregated_y = z @ y
+aggregated_y = w @ y
 
 # Note you can also get `z` by doing a row-wise softmax of a zeros tensor with
 # `-inf`s in the upper right triangle:
 w = torch.zeros(T, T)
 w = w.masked_fill(torch.tril(torch.ones(T, T)) == 0, float("-inf"))
 print(w)
-z = torch.nn.functional.softmax(z, dim=-1)
-assert torch.allclose(z @ y == aggregated_y)
+w = torch.nn.functional.softmax(w, dim=-1)
+assert torch.allclose(w @ y == aggregated_y)
 ```
 
-The matrix `z` defines the 'Affinities' - how much do we want to weight the embedding of each preceding token when aggregating the result for a give token. These are the weightings of the aggregation function. The `-inf` values indicate that we want to ignore all 'future' tokens.
+The matrix `w` defines the 'Affinities' - how much do we want to weight the embedding of each preceding token when aggregating the result for a give token. These are the weightings of the aggregation function. The `-inf` values indicate that we want to ignore all 'future' tokens.
 
 So now we have a way of considering all previous tokens within the context when predicting the next token. But we're missing two ingredients to get to self-attention:
 
@@ -97,29 +97,84 @@ So now we have a way of considering all previous tokens within the context when 
 
 Here set the values of the affinity matrix statically to always take a simple average of preceding token embeddings, but in self-attention we calculate these affinities dynamically to achieve these objectives.
 
-### Encoding position in the sequence embedding (TODO does this follow on from above, or is this an aside?)
+### On naming
 
-To also encode the position of the tokens in the tensor that we pass to the first head of the network, we introduce a second embedding matrix: a position embedding matrix. This can be combined, via simple addition, with the gathered embedding vectors for the tokens in the input sequence:
+The 'Encoder' of a GPT language model generally refers to nearly the entire forward pass, up to the point... TODO
+
+In the simple case, a 'Decoder' could just a linear layer to convert the output of the encoder to shape `(T, V)`, and a softmax to convert the values to probabilities (of the next token), then a sampling from the probabilities of the last token to produce the next token. But this decoder is still technically a bigram model in that it samples only from the probabilities of the final token. Note that the final linear layer transforms an embedding of a token (and its position) INDEPENDENTLY of other tokens. Generally decoders will contain their own self-attention layers. TODO explain more.
+
+### Encoding position in the sequence embedding
+
+To also encode the position of the tokens in the tensor that we pass to the first head of the network (see (1) above), we introduce a second embedding matrix: a position embedding matrix. This can be combined, via simple addition, with the gathered embedding vectors for the tokens in the input sequence:
+
+```python
+token_embed = torch.nn.Embedding(V, C) # token embedding table, (V, C)
+pos_embed = torch.nn.Embedding(T, C) # pos embedding table, (T, C)
+t_embed = token_embed(x) # embeddings at indices in input, x, (T, C)
+p_embed = pos_embed(torch.arange(T)) # == pos_embed.weight, (T, C)
+y = t_embed + p_embed
+```
 
 TODO Is this the only way we achieve (1) above, or do we do that too inside a self-attention 'head'?
 
-```python
-embed = torch.nn.Embedding(V, C) # token embedding table, (V, C)
-pos_embed = torch.nn.Embedding(T, C) # pos embedding table, (T, C)
-y = embed(x) # embeddings at indices in input, x, (T, C)
-p = pos_embed(torch.arange(T)) # == pos_embed.weight, (T, C)
-z = y + p
+### Self-attention: "learning to pick affinities data-dependently"
 
-# TODO is `z` what we refer to as the output of the encoder, i.e. it encodes them through their token embedding and positional embedding?
-```
-
-### The cruz of self-attention
-
-Each token emits two vectors:
+Each token emits 3 vectors:
 
 1. A query: "what am I looking for?"
 2. A key: "what do I contain?"
+3. A value: "if you find what I contain interesting, here's what I will comunicate to you"
 
-Affinities (see the above `z` matrix`) between tokens in a sequence are calculated by doing dot-products between Queries and Keys.
+Affinities (see the above `w` matrix`) between tokens in a sequence are calculated by doing dot-products between Queries and Keys. "How much does the key for each token match with the queries of the other tokens"?
 
-Each token's Query vector dot-products with the Keys of all other tokens.
+Each token's Query vector dot-products with the Keys of all other tokens, and these results form the aggregation weightings of `w`.
+
+Let's see what this looks like:
+
+```python
+# Initialise an activation tensor, either the token embeddings
+# (remember y = embed(x)) or an intermediate activation in the model that has
+# the same shape.
+T, C = 3, 5 # context size, embedding channels
+y = torch.randn(T, C)
+head_size = 16 # Some hyperparameter of the model, H
+get_key = torch.nn.Linear(C, head_size, bias=False) # get_key.weight shape (H, C)
+get_query = torch.nn.Linear(C, head_size, bias=False) # get_query.weight shape (H, C)
+# (T, C) @ (C, H) matrix multiplications
+k = get_key(y) # (T, H)
+q = get_query(y) # (T, H)
+```
+
+The matrix multiplies act independently across the context size (`T`) dimension, so `k` and `q` are the idependent key and query vectors corresponding to each token in input `x`.
+
+Now we dot-product each query with each key (see `q @ k.T`). This result initializes the affinities in our weighted aggregation matrix `w`. We still zero the top right triangle (as tokens can't see into the future), and normalize:
+
+```python
+w = q @ k.T # == k @ q.T, (T, T)
+w = w.masked_fill(torch.tril(torch.ones(T, T)) == 0, float("-inf"))
+w = torch.nn.functional.softmax(w, dim=-1)
+```
+
+Now the aggregation weightings/affinities/attention scores are also data-dependent (see (2) above).
+
+Let's tell a story of the experience of a single token as it travels through the first attention head to demonstrate the above concepts in action:
+
+- A sequence of tokens is passed into the network, `[_, _, _, M]`.
+- The last token in the sequence, `M`, is represented as an index into the vocabulary of the input data set.
+- The token's value is used to gather an embedding vector representing that token `y_M = token_embed(onehot(M))`.
+- This gives the token `M` semantic value: we now have some better information about what `M` _is_.
+- Then we add this vector to the positional embedding vector for the last token in the context `y_M += pos_embed(onehot(T-1))`.
+- Now this vector contains semantic information about the token, as well as information about the token's position in the sequence. e.g. "I'm the letter 'a', and I'm in the last position in the context"
+- Now we move this vector/embedding along, into the first attention head. We do two matrix multiplications to compute the key and query for this embedding, based on its semantic and positional knowledge of itself.
+- e.g. the query could be "I'm looking for consonants in positions 0-3", and the key could be "I'm a vowel, and I'm in the second half of the context".
+- All other tokens emit keys (and queries) as well. We use these to compute the affinity matrix. Let's take a look at the final row, `w`, corresponding to the affinities with the final token in the context:
+  - `print(w[-1]) -> [0.01, 0.55, 0.16, 0.28]`. Here we see that the second token has a high affinity (0.55) with our token `M`, meaning its key matches well with the `M`'s query.
+- So when we perform the aggregation `softmax(mask(w)) @ y`, we end up incorporating lots of the embedding from the second token into the output vector corresponding to `M`'s token.
+
+Unlike in the simple example above, we do not MM the affinities directly with the input embeddings for the sequence, but with the Values corresponding to these tokens. Attention heads aggregate Values (linearly transformed embeddings corresponding to input tokens) based on how well the Keys match with the Queries.
+
+```python
+get_value = torch.nn.Linear(C, head_size, bias=False) # get_value.weight shape (H, C)
+v = get_value(y) # (T, H)
+aggregated_y = w @ v
+```
