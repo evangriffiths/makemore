@@ -217,9 +217,6 @@ BERT is an example of a 'encoder-only' model, because all its attention layers a
 
 GPTs are examples of 'decoder-only' models because they only allow tokens to communicate with themselves and ealier tokens, and then auto-regressively predict the next token.
 
-TODO old:
-In the simple case, a 'Decoder' could just a linear layer to convert the output of the encoder to shape `(T, V)`, and a softmax to convert the values to probabilities (of the next token), then a sampling from the probabilities of the last token to produce the next token. But this decoder is still technically a bigram model in that it samples only from the probabilities of the final token. Note that the final linear layer transforms an embedding of a token (and its position) INDEPENDENTLY of other tokens. Generally decoders will contain their own self-attention layers. TODO explain more.
-
 ### Multi-head attention
 
 - Multiple self-attention heads act on the input tensor in parallel.
