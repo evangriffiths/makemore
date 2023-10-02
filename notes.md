@@ -97,12 +97,6 @@ So now we have a way of considering all previous tokens within the context when 
 
 Here set the values of the affinity matrix statically to always take a simple average of preceding token embeddings, but in self-attention we calculate these affinities dynamically to achieve these objectives.
 
-### On naming
-
-The 'Encoder' of a GPT language model generally refers to nearly the entire forward pass, up to the point... TODO
-
-In the simple case, a 'Decoder' could just a linear layer to convert the output of the encoder to shape `(T, V)`, and a softmax to convert the values to probabilities (of the next token), then a sampling from the probabilities of the last token to produce the next token. But this decoder is still technically a bigram model in that it samples only from the probabilities of the final token. Note that the final linear layer transforms an embedding of a token (and its position) INDEPENDENTLY of other tokens. Generally decoders will contain their own self-attention layers. TODO explain more.
-
 ### Encoding position in the sequence embedding
 
 To also encode the position of the tokens in the tensor that we pass to the first head of the network (see (1) above), we introduce a second embedding matrix: a position embedding matrix. This can be combined, via simple addition, with the gathered embedding vectors for the tokens in the input sequence:
@@ -115,7 +109,7 @@ p_embed = pos_embed(torch.arange(T)) # == pos_embed.weight, (T, C)
 y = t_embed + p_embed
 ```
 
-TODO Is this the only way we achieve (1) above, or do we do that too inside a self-attention 'head'?
+We will see below that the self-attention mechanism doesn't have a notion of position, when something about one token is communicated to another. It is only from adding this positional embedding that this information is encoded (and then communicated in self-attention).
 
 ### Self-attention: "learning to pick affinities data-dependently"
 
@@ -123,7 +117,7 @@ Each token emits 3 vectors:
 
 1. A query: "what am I looking for?"
 2. A key: "what do I contain?"
-3. A value: "if you find what I contain interesting, here's what I will comunicate to you"
+3. A value: "what I want to communicate to other tokens"
 
 Affinities (see the above `w` matrix`) between tokens in a sequence are calculated by doing dot-products between Queries and Keys. "How much does the key for each token match with the queries of the other tokens"?
 
@@ -151,9 +145,12 @@ Now we dot-product each query with each key (see `q @ k.T`). This result initial
 
 ```python
 w = q @ k.T # == k @ q.T, (T, T)
+w = w * head_size ** -0.5
 w = w.masked_fill(torch.tril(torch.ones(T, T)) == 0, float("-inf"))
 w = torch.nn.functional.softmax(w, dim=-1)
 ```
+
+Note we normalize weights by `1/sqrt(head_size)` to maintain unit variance at initialization. Otherwise the softmax operation will result in a more 'pointy' output (largest value in input will map to an even larger value in output relative to other values).
 
 Now the aggregation weightings/affinities/attention scores are also data-dependent (see (2) above).
 
@@ -178,3 +175,65 @@ get_value = torch.nn.Linear(C, head_size, bias=False) # get_value.weight shape (
 v = get_value(y) # (T, H)
 aggregated_y = w @ v
 ```
+
+### Self-attention as a communication mechanism
+
+AK uses the analogy that self-attention is like communication between nodes in a directed graph. The nodes are the tokens in a sequence, and the communication pattern is defined by the constraint that nodes can only speak with previous nodes/tokens in the context. The information that is communicated along the edges of the graph is data-dependent.
+
+Note that this constraint that 'tokens can't talk to future tokens' that we make with the zeroing of the upper triangle of `w`:
+
+```python
+w.masked_fill(torch.tril(torch.ones(T, T)) == 0, float("-inf"))
+```
+
+doesn't have to be applied in all language models. We do it here because we're trying to predict the next character. But if we wanted to do e.g. sentiment analysis/text classification, we wouldn't necessarily apply this constraint.
+
+AK says that the upper triangular zero-mask is applied to attention heads in decoder blocks, but not in encoder blocks.
+
+Note we call these GPT models "autoregressive":
+
+> "autoregressive" refers to the property of generating outputs one step at a time in a sequential manner, where each step depends on the previously generated steps.
+
+### The 'self' in self-attention
+
+We call it self-attention because the queries, keys and values all come from the same source (in the above code snippets, the input `y`). Cross-attention is where the keys and values come from a separate source.
+
+If you look at the diagram from the 'attention is all you need' paper, there's cross-attention in a decoder layer, as:
+
+- the Queries are still emitted by the input `y`
+- but the Keys and Values are emitted from the output of an encoder block.
+
+This is because the model proposed in the paper is used for language translation. So the encoder is used to encode the 'sentence to be translated' (without using the triangular mask, as all tokens can speak to eachother), and the `k,v`s are passed to the decoder blocks, which generate the translated sentence tokens.
+
+Decoder-only networks (including GPTs) do not contain cross-attention layers (as they do not need to condition on the output of any encoder layers).
+
+### Encoder vs Decoder
+
+The model described in the AIAYN paper is an 'encoder-decoder' model. The only difference between the two in the self-attention layer is just whether or not the attention weights (`w`) is zero-ed out in the top-right triangle. If not, this allows tokens to communicate with later tokens in the sequence. This is allowed in encoder layers, but not in decoder layers.
+
+The paper used attention in a machine language translation application, where the sentence to be translated was processed by the encoder, then the translated sentence was generated by the decoder.
+
+BERT is an example of a 'encoder-only' model, because all its attention layers allow for communication between all tokens in the input sequence. That's because its downstream applications are e.g. text classification, and sentiment analysis where a prediction is made based on all tokens at once.
+
+GPTs are examples of 'decoder-only' models because they only allow tokens to communicate with themselves and ealier tokens, and then auto-regressively predict the next token.
+
+TODO old:
+In the simple case, a 'Decoder' could just a linear layer to convert the output of the encoder to shape `(T, V)`, and a softmax to convert the values to probabilities (of the next token), then a sampling from the probabilities of the last token to produce the next token. But this decoder is still technically a bigram model in that it samples only from the probabilities of the final token. Note that the final linear layer transforms an embedding of a token (and its position) INDEPENDENTLY of other tokens. Generally decoders will contain their own self-attention layers. TODO explain more.
+
+### Multi-head attention
+
+- Multiple self-attention heads act on the input tensor in parallel.
+- Their outputs are concatented along the channel axis, then passed through a linear layer, so the outputs of individual heads are combined.
+
+### Feedforward layer
+
+- After the attention layer (in actual paper, 1x self attention if encoder block, or 1x SA followed by 1x cross attention if decoder block), there is a feed-forward layer.
+- AK gives the analogy of "the self-attention layer allows tokens to communicate with eachother different aspects of what that contain (message passing of features), whereas the FF layer allows the tokens to think about the messages they were passed".
+
+### Optimisation tricks
+
+To make the network more trainable, the AIAYN paper employs typical DL model tricks:
+
+- Skip connections, to prevent vanishing gradients during backprop. Important for deep networks.
+- Layernorm to improve stability of gradients during training. Apparently the location of norms has changed in standard practice vs. what is originally proposed in the paper.
+- Dropout layers at various points in the block, to prevent overfitting.
